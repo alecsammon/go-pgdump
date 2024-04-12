@@ -21,7 +21,7 @@ func getTables(db *sql.DB) ([]string, error) {
 		if err := rows.Scan(&tableName); err != nil {
 			return nil, err
 		}
-		tables = append(tables, tableName)
+		tables = append(tables, strings.Replace(tableName, "public.", "", 1))
 	}
 	return tables, nil
 }
