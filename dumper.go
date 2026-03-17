@@ -53,6 +53,17 @@ func (d *Dumper) DumpDatabaseToWriter(writer io.Writer, opts *TableOptions) erro
 		return err
 	}
 
+	// Dump enum types before tables so columns can reference them
+	enumSQL, err := getEnumTypes(db)
+	if err != nil {
+		return err
+	}
+	if enumSQL != "" {
+		if _, err := io.WriteString(writer, enumSQL); err != nil {
+			return err
+		}
+	}
+
 	tables, err := getTables(db, opts)
 	if err != nil {
 		return err

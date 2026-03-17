@@ -51,9 +51,55 @@ func getTables(db *sql.DB, opts *TableOptions) ([]string, error) {
 	return tables, nil
 }
 
+// getEnumTypes queries the database for all user-defined enum types and returns
+// the SQL statements to recreate them.
+func getEnumTypes(db *sql.DB) (string, error) {
+	query := `
+SELECT t.typname AS enum_name,
+       string_agg(e.enumlabel, ',' ORDER BY e.enumsortorder) AS enum_values
+FROM pg_type t
+JOIN pg_enum e ON t.oid = e.enumtypid
+JOIN pg_namespace n ON t.typnamespace = n.oid
+WHERE n.nspname = 'public'
+GROUP BY t.typname
+ORDER BY t.typname;`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return "", fmt.Errorf("error querying enum types: %w", err)
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var enumName, enumValues string
+		if err := rows.Scan(&enumName, &enumValues); err != nil {
+			return "", fmt.Errorf("error scanning enum type: %w", err)
+		}
+		labels := strings.Split(enumValues, ",")
+		for i, l := range labels {
+			labels[i] = "'" + l + "'"
+		}
+		sb.WriteString(fmt.Sprintf(
+			"CREATE TYPE %s AS ENUM (%s);\n\n",
+			escapeReservedName(enumName),
+			strings.Join(labels, ", "),
+		))
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("error iterating enum types: %w", err)
+	}
+
+	return sb.String(), nil
+}
+
 // generates the SQL for creating a table, including column definitions.
 func getCreateTableStatement(db *sql.DB, tableName string) (string, error) {
-	query := fmt.Sprintf("SELECT column_name, data_type, character_maximum_length FROM information_schema.columns WHERE table_name = '%s'", tableName)
+	query := fmt.Sprintf(
+		"SELECT column_name, data_type, udt_name, character_maximum_length FROM information_schema.columns WHERE table_name = '%s' ORDER BY ordinal_position",
+		tableName,
+	)
 	rows, err := db.Query(query)
 	if err != nil {
 		return "", err
@@ -62,11 +108,17 @@ func getCreateTableStatement(db *sql.DB, tableName string) (string, error) {
 
 	var columns []string
 	for rows.Next() {
-		var columnName, dataType string
+		var columnName, dataType, udtName string
 		var charMaxLength *int
-		if err := rows.Scan(&columnName, &dataType, &charMaxLength); err != nil {
+		if err := rows.Scan(&columnName, &dataType, &udtName, &charMaxLength); err != nil {
 			return "", err
 		}
+
+		// When data_type is USER-DEFINED, use the actual type name from udt_name
+		if dataType == "USER-DEFINED" {
+			dataType = udtName
+		}
+
 		columnDef := fmt.Sprintf("%s %s", columnName, dataType)
 		if charMaxLength != nil {
 			columnDef += fmt.Sprintf("(%d)", *charMaxLength)
@@ -100,12 +152,7 @@ func getTableDataCopyFormat(db *sql.DB, tableName string) (string, error) {
 		scanArgs[i] = &values[i]
 	}
 
-	var output strings.Builder
-	output.WriteString(fmt.Sprintf(
-		"COPY %s (%s) FROM stdin;\n",
-		escapeReservedName(tableName),
-		strings.Join(columns, ", "),
-	))
+	var dataRows []string
 	for rows.Next() {
 		err := rows.Scan(scanArgs...)
 		if err != nil {
@@ -113,9 +160,28 @@ func getTableDataCopyFormat(db *sql.DB, tableName string) (string, error) {
 		}
 		var valueStrings []string
 		for _, value := range values {
-			valueStrings = append(valueStrings, string(value))
+			if value == nil {
+				valueStrings = append(valueStrings, "\\N")
+			} else {
+				valueStrings = append(valueStrings, string(value))
+			}
 		}
-		output.WriteString(strings.Join(valueStrings, "\t") + "\n")
+		dataRows = append(dataRows, strings.Join(valueStrings, "\t"))
+	}
+
+	// Skip COPY block entirely if there are no rows
+	if len(dataRows) == 0 {
+		return "", nil
+	}
+
+	var output strings.Builder
+	output.WriteString(fmt.Sprintf(
+		"COPY %s (%s) FROM stdin;\n",
+		escapeReservedName(tableName),
+		strings.Join(columns, ", "),
+	))
+	for _, row := range dataRows {
+		output.WriteString(row + "\n")
 	}
 	output.WriteString("\\.\n")
 
