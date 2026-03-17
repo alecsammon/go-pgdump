@@ -64,24 +64,59 @@ func (d *Dumper) DumpDatabaseToWriter(writer io.Writer, opts *TableOptions) erro
 		}
 	}
 
-	tables, err := getTables(db, opts)
+	allTables, err := getTables(db, opts)
 	if err != nil {
 		return err
 	}
+
+	// Separate into partitioned parents, regular tables, and partition children.
+	// Order matters: parents must be created before their children.
+	var parentTables, regularTables, partitionChildren []tableInfo
+	for _, t := range allTables {
+		switch {
+		case t.IsPartitioned:
+			parentTables = append(parentTables, t)
+		case t.IsPartition:
+			partitionChildren = append(partitionChildren, t)
+		default:
+			regularTables = append(regularTables, t)
+		}
+	}
+
+	// Dump partitioned parents and regular tables first (can be parallelised)
+	nonPartitionTables := append(parentTables, regularTables...)
 
 	var (
 		wg sync.WaitGroup
 		mx sync.Mutex
 	)
 
-	chunks := slices.Chunk(tables, d.Parallels)
+	chunks := slices.Chunk(nonPartitionTables, d.Parallels)
 	for chunk := range chunks {
 		wg.Add(len(chunk))
 		for _, table := range chunk {
-			//we can add the switch here for export and add a go func here.
-			go func(table string) {
+			go func(table tableInfo) {
 				defer wg.Done()
 				str, err := scriptTable(db, table)
+				if err != nil {
+					return
+				}
+				mx.Lock()
+				io.WriteString(writer, str)
+				mx.Unlock()
+			}(table)
+		}
+		wg.Wait()
+	}
+
+	// Dump partition children after parents
+	partChunks := slices.Chunk(partitionChildren, d.Parallels)
+	for chunk := range partChunks {
+		wg.Add(len(chunk))
+		for _, table := range chunk {
+			go func(table tableInfo) {
+				defer wg.Done()
+				str, err := scriptPartition(db, table)
 				if err != nil {
 					return
 				}
@@ -138,25 +173,25 @@ func (d *Dumper) DumpDBToCSV(outputDIR, outputFile string, opts *TableOptions) e
 		return err
 	}
 
-	tablename, err := getTables(db, opts)
+	allTables, err := getTables(db, opts)
 	if err != nil {
 		return err
 	}
 
-	chunks := slices.Chunk(tablename, d.Parallels)
+	chunks := slices.Chunk(allTables, d.Parallels)
 	g, _ := errgroup.WithContext(context.Background())
 	for chunk := range chunks {
 		g.SetLimit(len(chunk))
 		for _, table := range chunk {
 			table := table // capture the current value of table for use in goroutine
 			g.Go(func() error {
-				records, err := getTableDataAsCSV(db, table)
+				records, err := getTableDataAsCSV(db, table.Name)
 				if err != nil {
 					return err
 				}
 
 				// Correctly open (or create) the file for writing
-				f, err := os.Create(path.Join(outputDIR, table+".csv"))
+				f, err := os.Create(path.Join(outputDIR, table.Name+".csv"))
 				if err != nil {
 					return err
 				}
@@ -177,42 +212,64 @@ func (d *Dumper) DumpDBToCSV(outputDIR, outputFile string, opts *TableOptions) e
 	return nil
 }
 
-func scriptTable(db *sql.DB, tableName string) (string, error) {
+func scriptTable(db *sql.DB, table tableInfo) (string, error) {
 	var buffer string
 	// Script CREATE TABLE statement
-	createStmt, err := getCreateTableStatement(db, tableName)
+	createStmt, err := getCreateTableStatement(db, table)
 	if err != nil {
-		return "", fmt.Errorf("error creating table statement for %s: %v", tableName, err)
+		return "", fmt.Errorf("error creating table statement for %s: %v", table.Name, err)
 	}
 	buffer = buffer + createStmt + "\n\n"
 
 	// Script associated sequences (if any)
-	seqStmts, err := scriptSequences(db, tableName)
+	seqStmts, err := scriptSequences(db, table.Name)
 	if err != nil {
-		return "", fmt.Errorf("error scripting sequences for table %s: %v", tableName, err)
+		return "", fmt.Errorf("error scripting sequences for table %s: %v", table.Name, err)
 	}
 	buffer = buffer + seqStmts + "\n\n"
 
-	// Script primary keys
-	pkStmt, err := scriptPrimaryKeys(db, tableName)
+	// Script primary keys (partitioned parents define PKs on the parent; children inherit them)
+	pkStmt, err := scriptPrimaryKeys(db, table.Name)
 	if err != nil {
-		return "", fmt.Errorf("error scripting primary keys for table %s: %v", tableName, err)
+		return "", fmt.Errorf("error scripting primary keys for table %s: %v", table.Name, err)
 	}
 	buffer = buffer + pkStmt + "\n\n"
 
 	// Script table and column comments
-	commentStmts, err := scriptComments(db, tableName)
+	commentStmts, err := scriptComments(db, table.Name)
 	if err != nil {
-		return "", fmt.Errorf("error scripting comments for table %s: %v", tableName, err)
+		return "", fmt.Errorf("error scripting comments for table %s: %v", table.Name, err)
 	}
 	if commentStmts != "" {
 		buffer = buffer + commentStmts + "\n"
 	}
 
-	// Dump table data
-	copyStmt, err := getTableDataCopyFormat(db, tableName)
+	// Dump table data — skip for partitioned parents since data lives in partitions
+	if !table.IsPartitioned {
+		copyStmt, err := getTableDataCopyFormat(db, table.Name)
+		if err != nil {
+			return "", fmt.Errorf("error generating COPY statement for table %s: %v", table.Name, err)
+		}
+		buffer = buffer + copyStmt + "\n\n"
+	}
+
+	return buffer, nil
+}
+
+func scriptPartition(db *sql.DB, table tableInfo) (string, error) {
+	var buffer string
+
+	// Script CREATE TABLE ... PARTITION OF ... FOR VALUES ...
+	createStmt, err := getCreatePartitionStatement(db, table)
 	if err != nil {
-		return "", fmt.Errorf("error generating COPY statement for table %s: %v", tableName, err)
+		return "", fmt.Errorf("error creating partition statement for %s: %v", table.Name, err)
+	}
+	buffer = buffer + createStmt + "\n\n"
+
+	// Dump partition data
+	copyStmt, err := getTableDataCopyFormat(db, table.Name)
+	if err != nil {
+		return "", fmt.Errorf("error generating COPY statement for %s: %v", table.Name, err)
 	}
 	buffer = buffer + copyStmt + "\n\n"
 

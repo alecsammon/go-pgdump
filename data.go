@@ -13,22 +13,38 @@ type TableOptions struct {
 	Schema      string
 }
 
-// returns a slice of table names matching options, if left blank will default to :
-//
-//	-> no prefix or suffix
-//	-> public schema
-func getTables(db *sql.DB, opts *TableOptions) ([]string, error) {
-	var (
-		query string
-	)
+// tableInfo holds metadata about a table for partition-aware dumping.
+type tableInfo struct {
+	Name          string
+	IsPartitioned bool // true if this is a partitioned parent (relkind = 'p')
+	IsPartition   bool // true if this is a child partition
+	ParentName    string
+}
+
+// returns table metadata for all tables matching options.
+// Categorises tables as regular, partitioned parents, or partition children.
+func getTables(db *sql.DB, opts *TableOptions) ([]tableInfo, error) {
+	schema := "public"
+	likePattern := "%%"
 	if opts != nil {
-		if opts.Schema == "" {
-			opts.Schema = "public"
+		if opts.Schema != "" {
+			schema = opts.Schema
 		}
-		query = fmt.Sprintf("SELECT table_name FROM information_schema.tables WHERE table_schema = '%s' AND table_name LIKE '%s'", opts.Schema, (opts.TablePrefix + "%%" + opts.TableSuffix))
-	} else {
-		query = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
+		likePattern = opts.TablePrefix + "%%" + opts.TableSuffix
 	}
+
+	query := fmt.Sprintf(`
+SELECT c.relname,
+       c.relkind,
+       COALESCE(parent.relname, '') AS parent_name
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_inherits inh ON inh.inhrelid = c.oid
+LEFT JOIN pg_class parent ON parent.oid = inh.inhparent
+WHERE n.nspname = '%s'
+  AND c.relkind IN ('r', 'p')
+  AND c.relname LIKE '%s'
+ORDER BY c.relname;`, schema, likePattern)
 
 	rows, err := db.Query(query)
 	if err != nil {
@@ -36,19 +52,67 @@ func getTables(db *sql.DB, opts *TableOptions) ([]string, error) {
 	}
 	defer rows.Close()
 
-	var tables []string
+	var tables []tableInfo
 	for rows.Next() {
-		var tableName string
-		if err := rows.Scan(&tableName); err != nil {
+		var name, relkind, parentName string
+		if err := rows.Scan(&name, &relkind, &parentName); err != nil {
 			return nil, err
 		}
-		if opts.Schema != "public" {
-			tables = append(tables, opts.Schema+"."+tableName)
-		} else {
-			tables = append(tables, tableName)
+		ti := tableInfo{
+			Name:          name,
+			IsPartitioned: relkind == "p",
+			IsPartition:   parentName != "",
+			ParentName:    parentName,
 		}
+		if schema != "public" {
+			ti.Name = schema + "." + ti.Name
+			if ti.ParentName != "" {
+				ti.ParentName = schema + "." + ti.ParentName
+			}
+		}
+		tables = append(tables, ti)
 	}
 	return tables, nil
+}
+
+// getPartitionBound returns the partition bound expression for a child partition.
+func getPartitionBound(db *sql.DB, tableName string) (string, error) {
+	query := `
+SELECT pg_get_expr(c.relpartbound, c.oid)
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = $1 AND n.nspname = 'public';`
+
+	var bound string
+	if err := db.QueryRow(query, tableName).Scan(&bound); err != nil {
+		return "", fmt.Errorf("error querying partition bound for %s: %w", tableName, err)
+	}
+	return bound, nil
+}
+
+// getPartitionStrategy returns the PARTITION BY clause for a partitioned parent table.
+func getPartitionStrategy(db *sql.DB, tableName string) (string, error) {
+	query := `
+SELECT
+    CASE p.partstrat
+        WHEN 'r' THEN 'RANGE'
+        WHEN 'l' THEN 'LIST'
+        WHEN 'h' THEN 'HASH'
+    END AS strategy,
+    string_agg(a.attname, ', ' ORDER BY pos.ordinality) AS columns
+FROM pg_partitioned_table p
+JOIN pg_class c ON c.oid = p.partrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+JOIN LATERAL unnest(p.partattrs::int[]) WITH ORDINALITY AS pos(attnum, ordinality) ON true
+JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = pos.attnum
+WHERE c.relname = $1 AND n.nspname = 'public'
+GROUP BY p.partstrat;`
+
+	var strategy, columns string
+	if err := db.QueryRow(query, tableName).Scan(&strategy, &columns); err != nil {
+		return "", fmt.Errorf("error querying partition strategy for %s: %w", tableName, err)
+	}
+	return fmt.Sprintf("PARTITION BY %s (%s)", strategy, columns), nil
 }
 
 // getEnumTypes queries the database for all user-defined enum types and returns
@@ -94,15 +158,15 @@ ORDER BY t.typname;`
 	return sb.String(), nil
 }
 
-// generates the SQL for creating a table, including column definitions.
-func getCreateTableStatement(db *sql.DB, tableName string) (string, error) {
+// getColumnDefinitions returns the column definitions for a table.
+func getColumnDefinitions(db *sql.DB, tableName string) ([]string, error) {
 	query := fmt.Sprintf(
 		"SELECT column_name, data_type, udt_name, character_maximum_length FROM information_schema.columns WHERE table_name = '%s' ORDER BY ordinal_position",
 		tableName,
 	)
 	rows, err := db.Query(query)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer rows.Close()
 
@@ -111,7 +175,7 @@ func getCreateTableStatement(db *sql.DB, tableName string) (string, error) {
 		var columnName, dataType, udtName string
 		var charMaxLength *int
 		if err := rows.Scan(&columnName, &dataType, &udtName, &charMaxLength); err != nil {
-			return "", err
+			return nil, err
 		}
 
 		// When data_type is USER-DEFINED, use the actual type name from udt_name
@@ -125,11 +189,45 @@ func getCreateTableStatement(db *sql.DB, tableName string) (string, error) {
 		}
 		columns = append(columns, columnDef)
 	}
+	return columns, nil
+}
+
+// generates the SQL for creating a regular or partitioned parent table.
+func getCreateTableStatement(db *sql.DB, table tableInfo) (string, error) {
+	columns, err := getColumnDefinitions(db, table.Name)
+	if err != nil {
+		return "", err
+	}
+
+	suffix := ""
+	if table.IsPartitioned {
+		partClause, err := getPartitionStrategy(db, table.Name)
+		if err != nil {
+			return "", err
+		}
+		suffix = " " + partClause
+	}
 
 	return fmt.Sprintf(
-		"CREATE TABLE %s (\n    %s\n);",
-		escapeReservedName(tableName),
+		"CREATE TABLE %s (\n    %s\n)%s;",
+		escapeReservedName(table.Name),
 		strings.Join(columns, ",\n    "),
+		suffix,
+	), nil
+}
+
+// getCreatePartitionStatement generates CREATE TABLE ... PARTITION OF ... FOR VALUES ...
+func getCreatePartitionStatement(db *sql.DB, table tableInfo) (string, error) {
+	bound, err := getPartitionBound(db, table.Name)
+	if err != nil {
+		return "", err
+	}
+
+	return fmt.Sprintf(
+		"CREATE TABLE %s PARTITION OF %s %s;",
+		escapeReservedName(table.Name),
+		escapeReservedName(table.ParentName),
+		bound,
 	), nil
 }
 
