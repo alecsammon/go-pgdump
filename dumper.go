@@ -213,27 +213,32 @@ func (d *Dumper) DumpDBToCSV(outputDIR, outputFile string, opts *TableOptions) e
 }
 
 func scriptTable(db *sql.DB, table tableInfo) (string, error) {
-	var buffer string
+	var sections []string
+
 	// Script CREATE TABLE statement
 	createStmt, err := getCreateTableStatement(db, table)
 	if err != nil {
 		return "", fmt.Errorf("error creating table statement for %s: %v", table.Name, err)
 	}
-	buffer = buffer + createStmt + "\n\n"
+	sections = append(sections, createStmt)
 
 	// Script associated sequences (if any)
 	seqStmts, err := scriptSequences(db, table.Name)
 	if err != nil {
 		return "", fmt.Errorf("error scripting sequences for table %s: %v", table.Name, err)
 	}
-	buffer = buffer + seqStmts + "\n\n"
+	if seqStmts != "" {
+		sections = append(sections, seqStmts)
+	}
 
 	// Script primary keys (partitioned parents define PKs on the parent; children inherit them)
 	pkStmt, err := scriptPrimaryKeys(db, table.Name)
 	if err != nil {
 		return "", fmt.Errorf("error scripting primary keys for table %s: %v", table.Name, err)
 	}
-	buffer = buffer + pkStmt + "\n\n"
+	if pkStmt != "" {
+		sections = append(sections, pkStmt)
+	}
 
 	// Script table and column comments
 	commentStmts, err := scriptComments(db, table.Name)
@@ -241,7 +246,7 @@ func scriptTable(db *sql.DB, table tableInfo) (string, error) {
 		return "", fmt.Errorf("error scripting comments for table %s: %v", table.Name, err)
 	}
 	if commentStmts != "" {
-		buffer = buffer + commentStmts + "\n"
+		sections = append(sections, commentStmts)
 	}
 
 	// Dump table data — skip for partitioned parents since data lives in partitions
@@ -250,30 +255,34 @@ func scriptTable(db *sql.DB, table tableInfo) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("error generating COPY statement for table %s: %v", table.Name, err)
 		}
-		buffer = buffer + copyStmt + "\n\n"
+		if copyStmt != "" {
+			sections = append(sections, copyStmt)
+		}
 	}
 
-	return buffer, nil
+	return strings.Join(sections, "\n") + "\n", nil
 }
 
 func scriptPartition(db *sql.DB, table tableInfo) (string, error) {
-	var buffer string
+	var sections []string
 
 	// Script CREATE TABLE ... PARTITION OF ... FOR VALUES ...
 	createStmt, err := getCreatePartitionStatement(db, table)
 	if err != nil {
 		return "", fmt.Errorf("error creating partition statement for %s: %v", table.Name, err)
 	}
-	buffer = buffer + createStmt + "\n\n"
+	sections = append(sections, createStmt)
 
 	// Dump partition data
 	copyStmt, err := getTableDataCopyFormat(db, table.Name)
 	if err != nil {
 		return "", fmt.Errorf("error generating COPY statement for %s: %v", table.Name, err)
 	}
-	buffer = buffer + copyStmt + "\n\n"
+	if copyStmt != "" {
+		sections = append(sections, copyStmt)
+	}
 
-	return buffer, nil
+	return strings.Join(sections, "\n") + "\n", nil
 }
 
 func scriptSequences(db *sql.DB, tableName string) (string, error) {
