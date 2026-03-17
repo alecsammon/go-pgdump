@@ -159,13 +159,22 @@ ORDER BY t.typname;`
 	return sb.String(), nil
 }
 
-// getColumnDefinitions returns the column definitions for a table.
+// getColumnDefinitions returns the column definitions for a table, including
+// NOT NULL constraints and DEFAULT values.
 func getColumnDefinitions(db *sql.DB, tableName string) ([]string, error) {
-	query := fmt.Sprintf(
-		"SELECT column_name, data_type, udt_name, character_maximum_length FROM information_schema.columns WHERE table_name = '%s' ORDER BY ordinal_position",
-		tableName,
-	)
-	rows, err := db.Query(query)
+	query := `
+SELECT
+    c.column_name,
+    c.data_type,
+    c.udt_name,
+    c.character_maximum_length,
+    c.is_nullable,
+    c.column_default
+FROM information_schema.columns c
+WHERE c.table_name = $1 AND c.table_schema = 'public'
+ORDER BY c.ordinal_position;`
+
+	rows, err := db.Query(query, tableName)
 	if err != nil {
 		return nil, err
 	}
@@ -173,20 +182,30 @@ func getColumnDefinitions(db *sql.DB, tableName string) ([]string, error) {
 
 	var columns []string
 	for rows.Next() {
-		var columnName, dataType, udtName string
+		var columnName, dataType, udtName, isNullable string
 		var charMaxLength *int
-		if err := rows.Scan(&columnName, &dataType, &udtName, &charMaxLength); err != nil {
+		var columnDefault *string
+		if err := rows.Scan(&columnName, &dataType, &udtName, &charMaxLength, &isNullable, &columnDefault); err != nil {
 			return nil, err
 		}
 
-		// When data_type is USER-DEFINED, use the actual type name from udt_name
-		if dataType == "USER-DEFINED" {
+		switch dataType {
+		case "USER-DEFINED":
 			dataType = udtName
+		case "ARRAY":
+			// udt_name for arrays is prefixed with underscore, e.g. "_text" for text[]
+			dataType = strings.TrimPrefix(udtName, "_") + "[]"
 		}
 
 		columnDef := fmt.Sprintf("%s %s", columnName, dataType)
 		if charMaxLength != nil {
 			columnDef += fmt.Sprintf("(%d)", *charMaxLength)
+		}
+		if columnDefault != nil {
+			columnDef += " DEFAULT " + *columnDefault
+		}
+		if isNullable == "NO" {
+			columnDef += " NOT NULL"
 		}
 		columns = append(columns, columnDef)
 	}
@@ -343,6 +362,186 @@ ORDER BY a.attnum;`, tableName)
 		return "", fmt.Errorf("error iterating column comments: %w", err)
 	}
 
+	return sb.String(), nil
+}
+
+// getExtensions returns CREATE EXTENSION statements for all installed extensions
+// that are not default PostgreSQL extensions.
+func getExtensions(db *sql.DB) (string, error) {
+	query := `
+SELECT extname
+FROM pg_extension
+WHERE extname NOT IN ('plpgsql')
+ORDER BY extname;`
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return "", fmt.Errorf("error querying extensions: %w", err)
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var extName string
+		if err := rows.Scan(&extName); err != nil {
+			return "", fmt.Errorf("error scanning extension: %w", err)
+		}
+		sb.WriteString(fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s;\n", escapeReservedName(extName)))
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("error iterating extensions: %w", err)
+	}
+	return sb.String(), nil
+}
+
+// scriptIndexes returns CREATE INDEX statements for all non-primary-key indexes on a table.
+func scriptIndexes(db *sql.DB, tableName string) (string, error) {
+	query := `
+SELECT indexdef
+FROM pg_indexes
+WHERE tablename = $1
+  AND schemaname = 'public'
+  AND indexname NOT IN (
+    SELECT conname FROM pg_constraint
+    WHERE conrelid = (
+      SELECT oid FROM pg_class WHERE relname = $1
+        AND relnamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'public')
+    )
+    AND contype IN ('p', 'u')
+  )
+ORDER BY indexname;`
+
+	rows, err := db.Query(query, tableName)
+	if err != nil {
+		return "", fmt.Errorf("error querying indexes for %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var indexDef string
+		if err := rows.Scan(&indexDef); err != nil {
+			return "", fmt.Errorf("error scanning index: %w", err)
+		}
+		sb.WriteString(indexDef + ";\n")
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("error iterating indexes: %w", err)
+	}
+	return sb.String(), nil
+}
+
+// scriptForeignKeys returns ALTER TABLE ... ADD CONSTRAINT ... FOREIGN KEY statements.
+func scriptForeignKeys(db *sql.DB, tableName string) (string, error) {
+	query := `
+SELECT con.conname AS constraint_name,
+       pg_get_constraintdef(con.oid) AS constraint_def
+FROM pg_constraint con
+JOIN pg_class rel ON rel.oid = con.conrelid
+JOIN pg_namespace nsp ON nsp.oid = con.connamespace
+WHERE con.contype = 'f'
+  AND rel.relname = $1
+  AND nsp.nspname = 'public'
+ORDER BY con.conname;`
+
+	rows, err := db.Query(query, tableName)
+	if err != nil {
+		return "", fmt.Errorf("error querying foreign keys for %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var conName, conDef string
+		if err := rows.Scan(&conName, &conDef); err != nil {
+			return "", fmt.Errorf("error scanning foreign key: %w", err)
+		}
+		sb.WriteString(fmt.Sprintf(
+			"ALTER TABLE %s ADD CONSTRAINT %s %s;\n",
+			escapeReservedName(tableName),
+			escapeReservedName(conName),
+			conDef,
+		))
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("error iterating foreign keys: %w", err)
+	}
+	return sb.String(), nil
+}
+
+// scriptCheckConstraints returns ALTER TABLE ... ADD CONSTRAINT ... CHECK statements.
+func scriptCheckConstraints(db *sql.DB, tableName string) (string, error) {
+	query := `
+SELECT con.conname AS constraint_name,
+       pg_get_constraintdef(con.oid) AS constraint_def
+FROM pg_constraint con
+JOIN pg_class rel ON rel.oid = con.conrelid
+JOIN pg_namespace nsp ON nsp.oid = con.connamespace
+WHERE con.contype = 'c'
+  AND rel.relname = $1
+  AND nsp.nspname = 'public'
+ORDER BY con.conname;`
+
+	rows, err := db.Query(query, tableName)
+	if err != nil {
+		return "", fmt.Errorf("error querying check constraints for %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var conName, conDef string
+		if err := rows.Scan(&conName, &conDef); err != nil {
+			return "", fmt.Errorf("error scanning check constraint: %w", err)
+		}
+		sb.WriteString(fmt.Sprintf(
+			"ALTER TABLE %s ADD CONSTRAINT %s %s;\n",
+			escapeReservedName(tableName),
+			escapeReservedName(conName),
+			conDef,
+		))
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("error iterating check constraints: %w", err)
+	}
+	return sb.String(), nil
+}
+
+// scriptUniqueConstraints returns ALTER TABLE ... ADD CONSTRAINT ... UNIQUE statements.
+func scriptUniqueConstraints(db *sql.DB, tableName string) (string, error) {
+	query := `
+SELECT con.conname AS constraint_name,
+       pg_get_constraintdef(con.oid) AS constraint_def
+FROM pg_constraint con
+JOIN pg_class rel ON rel.oid = con.conrelid
+JOIN pg_namespace nsp ON nsp.oid = con.connamespace
+WHERE con.contype = 'u'
+  AND rel.relname = $1
+  AND nsp.nspname = 'public'
+ORDER BY con.conname;`
+
+	rows, err := db.Query(query, tableName)
+	if err != nil {
+		return "", fmt.Errorf("error querying unique constraints for %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	var sb strings.Builder
+	for rows.Next() {
+		var conName, conDef string
+		if err := rows.Scan(&conName, &conDef); err != nil {
+			return "", fmt.Errorf("error scanning unique constraint: %w", err)
+		}
+		sb.WriteString(fmt.Sprintf(
+			"ALTER TABLE %s ADD CONSTRAINT %s %s;\n",
+			escapeReservedName(tableName),
+			escapeReservedName(conName),
+			conDef,
+		))
+	}
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("error iterating unique constraints: %w", err)
+	}
 	return sb.String(), nil
 }
 

@@ -53,6 +53,17 @@ func (d *Dumper) DumpDatabaseToWriter(writer io.Writer, opts *TableOptions) erro
 		return err
 	}
 
+	// Dump extensions before types and tables
+	extSQL, err := getExtensions(db)
+	if err != nil {
+		return err
+	}
+	if extSQL != "" {
+		if _, err := io.WriteString(writer, extSQL+"\n"); err != nil {
+			return err
+		}
+	}
+
 	// Dump enum types before tables so columns can reference them
 	enumSQL, err := getEnumTypes(db)
 	if err != nil {
@@ -231,13 +242,49 @@ func scriptTable(db *sql.DB, table tableInfo, schemaOnly bool) (string, error) {
 		sections = append(sections, seqStmts)
 	}
 
-	// Script primary keys (partitioned parents define PKs on the parent; children inherit them)
+	// Script primary keys
 	pkStmt, err := scriptPrimaryKeys(db, table.Name)
 	if err != nil {
 		return "", fmt.Errorf("error scripting primary keys for table %s: %v", table.Name, err)
 	}
 	if pkStmt != "" {
 		sections = append(sections, pkStmt)
+	}
+
+	// Script unique constraints
+	ucStmt, err := scriptUniqueConstraints(db, table.Name)
+	if err != nil {
+		return "", fmt.Errorf("error scripting unique constraints for table %s: %v", table.Name, err)
+	}
+	if ucStmt != "" {
+		sections = append(sections, ucStmt)
+	}
+
+	// Script check constraints
+	ccStmt, err := scriptCheckConstraints(db, table.Name)
+	if err != nil {
+		return "", fmt.Errorf("error scripting check constraints for table %s: %v", table.Name, err)
+	}
+	if ccStmt != "" {
+		sections = append(sections, ccStmt)
+	}
+
+	// Script foreign keys
+	fkStmt, err := scriptForeignKeys(db, table.Name)
+	if err != nil {
+		return "", fmt.Errorf("error scripting foreign keys for table %s: %v", table.Name, err)
+	}
+	if fkStmt != "" {
+		sections = append(sections, fkStmt)
+	}
+
+	// Script indexes (non-PK, non-unique-constraint)
+	idxStmt, err := scriptIndexes(db, table.Name)
+	if err != nil {
+		return "", fmt.Errorf("error scripting indexes for table %s: %v", table.Name, err)
+	}
+	if idxStmt != "" {
+		sections = append(sections, idxStmt)
 	}
 
 	// Script table and column comments
