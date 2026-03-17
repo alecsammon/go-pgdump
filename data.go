@@ -11,6 +11,7 @@ type TableOptions struct {
 	TableSuffix string
 	TablePrefix string
 	Schema      string
+	SchemaOnly  bool // When true, only dump table definitions without row data
 }
 
 // tableInfo holds metadata about a table for partition-aware dumping.

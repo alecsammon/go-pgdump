@@ -97,7 +97,7 @@ func (d *Dumper) DumpDatabaseToWriter(writer io.Writer, opts *TableOptions) erro
 		for _, table := range chunk {
 			go func(table tableInfo) {
 				defer wg.Done()
-				str, err := scriptTable(db, table)
+				str, err := scriptTable(db, table, opts.SchemaOnly)
 				if err != nil {
 					return
 				}
@@ -116,7 +116,7 @@ func (d *Dumper) DumpDatabaseToWriter(writer io.Writer, opts *TableOptions) erro
 		for _, table := range chunk {
 			go func(table tableInfo) {
 				defer wg.Done()
-				str, err := scriptPartition(db, table)
+				str, err := scriptPartition(db, table, opts.SchemaOnly)
 				if err != nil {
 					return
 				}
@@ -212,7 +212,7 @@ func (d *Dumper) DumpDBToCSV(outputDIR, outputFile string, opts *TableOptions) e
 	return nil
 }
 
-func scriptTable(db *sql.DB, table tableInfo) (string, error) {
+func scriptTable(db *sql.DB, table tableInfo, schemaOnly bool) (string, error) {
 	var sections []string
 
 	// Script CREATE TABLE statement
@@ -250,7 +250,7 @@ func scriptTable(db *sql.DB, table tableInfo) (string, error) {
 	}
 
 	// Dump table data — skip for partitioned parents since data lives in partitions
-	if !table.IsPartitioned {
+	if !schemaOnly && !table.IsPartitioned {
 		copyStmt, err := getTableDataCopyFormat(db, table.Name)
 		if err != nil {
 			return "", fmt.Errorf("error generating COPY statement for table %s: %v", table.Name, err)
@@ -263,7 +263,7 @@ func scriptTable(db *sql.DB, table tableInfo) (string, error) {
 	return strings.Join(sections, "\n") + "\n", nil
 }
 
-func scriptPartition(db *sql.DB, table tableInfo) (string, error) {
+func scriptPartition(db *sql.DB, table tableInfo, schemaOnly bool) (string, error) {
 	var sections []string
 
 	// Script CREATE TABLE ... PARTITION OF ... FOR VALUES ...
@@ -274,12 +274,14 @@ func scriptPartition(db *sql.DB, table tableInfo) (string, error) {
 	sections = append(sections, createStmt)
 
 	// Dump partition data
-	copyStmt, err := getTableDataCopyFormat(db, table.Name)
-	if err != nil {
-		return "", fmt.Errorf("error generating COPY statement for %s: %v", table.Name, err)
-	}
-	if copyStmt != "" {
-		sections = append(sections, copyStmt)
+	if !schemaOnly {
+		copyStmt, err := getTableDataCopyFormat(db, table.Name)
+		if err != nil {
+			return "", fmt.Errorf("error generating COPY statement for %s: %v", table.Name, err)
+		}
+		if copyStmt != "" {
+			sections = append(sections, copyStmt)
+		}
 	}
 
 	return strings.Join(sections, "\n") + "\n", nil
