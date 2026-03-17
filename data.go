@@ -188,6 +188,65 @@ func getTableDataCopyFormat(db *sql.DB, tableName string) (string, error) {
 	return output.String(), nil
 }
 
+// scriptComments generates COMMENT ON statements for a table and its columns.
+func scriptComments(db *sql.DB, tableName string) (string, error) {
+	var sb strings.Builder
+
+	// Table comment
+	var tableComment *string
+	err := db.QueryRow(`
+SELECT obj_description(c.oid)
+FROM pg_class c
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = $1 AND n.nspname = 'public';`, tableName).Scan(&tableComment)
+	if err != nil {
+		return "", fmt.Errorf("error querying table comment for %s: %w", tableName, err)
+	}
+	if tableComment != nil && *tableComment != "" {
+		sb.WriteString(fmt.Sprintf(
+			"COMMENT ON TABLE %s IS '%s';\n",
+			escapeReservedName(tableName),
+			strings.ReplaceAll(*tableComment, "'", "''"),
+		))
+	}
+
+	// Column comments
+	rows, err := db.Query(`
+SELECT a.attname, col_description(a.attrelid, a.attnum)
+FROM pg_attribute a
+JOIN pg_class c ON c.oid = a.attrelid
+JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relname = $1
+  AND n.nspname = 'public'
+  AND a.attnum > 0
+  AND NOT a.attisdropped
+  AND col_description(a.attrelid, a.attnum) IS NOT NULL
+ORDER BY a.attnum;`, tableName)
+	if err != nil {
+		return "", fmt.Errorf("error querying column comments for %s: %w", tableName, err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var colName, colComment string
+		if err := rows.Scan(&colName, &colComment); err != nil {
+			return "", fmt.Errorf("error scanning column comment: %w", err)
+		}
+		sb.WriteString(fmt.Sprintf(
+			"COMMENT ON COLUMN %s.%s IS '%s';\n",
+			escapeReservedName(tableName),
+			escapeReservedName(colName),
+			strings.ReplaceAll(colComment, "'", "''"),
+		))
+	}
+
+	if err := rows.Err(); err != nil {
+		return "", fmt.Errorf("error iterating column comments: %w", err)
+	}
+
+	return sb.String(), nil
+}
+
 func getTableDataAsCSV(db *sql.DB, tableName string) ([][]string, error) {
 	query := fmt.Sprintf("SELECT * FROM %s", escapeReservedName(tableName))
 	rows, err := db.Query(query)

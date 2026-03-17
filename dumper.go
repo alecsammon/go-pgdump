@@ -200,6 +200,15 @@ func scriptTable(db *sql.DB, tableName string) (string, error) {
 	}
 	buffer = buffer + pkStmt + "\n\n"
 
+	// Script table and column comments
+	commentStmts, err := scriptComments(db, tableName)
+	if err != nil {
+		return "", fmt.Errorf("error scripting comments for table %s: %v", tableName, err)
+	}
+	if commentStmts != "" {
+		buffer = buffer + commentStmts + "\n"
+	}
+
 	// Dump table data
 	copyStmt, err := getTableDataCopyFormat(db, tableName)
 	if err != nil {
